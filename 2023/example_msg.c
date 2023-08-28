@@ -39,7 +39,7 @@
 #include <shared.h>
 
 //Build with
-//gcc -o example_rdm example_rdm.c -L<path to libfabric lib> -I<path to libfabric include> -lfabric
+//gcc -o example_msg example_msg.c -L<path to libfabric lib> -I<path to libfabric include> -lfabric
 
 #define BUF_SIZE 64
 
@@ -52,128 +52,23 @@ struct fid_ep *ep = NULL;
 struct fid_pep *pep = NULL;
 struct fid_cq *cq = NULL;
 struct fid_eq *eq = NULL;
+struct fi_cq_attr cq_attr = {0};
+struct fi_eq_attr eq_attr = {
+	.wait_obj = FI_WAIT_UNSPEC
+};
+//const struct sockaddr_in *sin;
+char str_addr[INET_ADDRSTRLEN];
+int ret;
 char buffer[BUF_SIZE];
 fi_addr_t fi_addr = FI_ADDR_UNSPEC;
 struct fi_eq_cm_entry entry;
 uint32_t event;
 ssize_t rd;
 
-
-int retrieve_conn_req(struct fid_eq *eq, struct fi_info **fi)
-{
-    int ret;
-
-    rd = fi_eq_sread(eq, &event, &entry, sizeof(entry), -1, 0);
-    if (rd != sizeof entry) {
-	ret = (int) rd;
-            printf("fi_eq_sread: %d", ret);
-	return ret;
-    }
-
-    *fi = entry.info;
-    if (event != FI_CONNREQ) {
-        fprintf(stderr, "Unexpected CM event %d\n", event);
-        ret = -FI_EOTHER;
-        return ret;
-    }
-
-    return 0;
-}
-
 /* Initializes all basic OFI resources to allow for a server/client to exchange a message */
-static int initialize(void)
+static int start_client(void)
 {
-	struct fi_cq_attr cq_attr = {0};
-	struct fi_eq_attr eq_attr = {0};
-	const struct sockaddr_in *sin;
-	char str_addr[INET_ADDRSTRLEN];
-	int ret;
-	//uint32_t event;
-	//ssize_t rd;
 
-	/* The first OFI call to happen for initialization is fi_getinfo which queries libfabric
-	 * and returns any appropriate providers that fulfill the hints requirements. Any applicable
-	 * providers will be returned as a list of fi_info structs (&info). Any info can be selected.
-	 * In this test we select the first fi_info struct. Assuming all hints were set appropriately,
-	 * the first fi_info should be most appropriate.
-	 * The flag FI_SOURCE is set for the server to indicate that the address/port refer to source
-	 * information. This is not set for the client because the fields refer to the server, not
-	 * the caller (client). */
-	ret = fi_getinfo(FI_VERSION(1,9), dst_addr, port, dst_addr ? 0 : FI_SOURCE,
-			 		hints, &fi_pep);
-	if (ret) {
-		printf("fi_getinfo error (%d)\n", ret);
-		return ret;
-	}
-
-
-	/* Initialize our fabric. The fabric network represents a collection of hardware and software
-	 * resources that access a single physical or virtual network. All network ports on a system
-	 * that can communicate with each other through their attached networks belong to the same fabric.
-	 */
-	ret = fi_fabric(fi_pep->fabric_attr, &fabric, NULL);
-	if (ret) {
-		printf("fi_fabric error (%d)\n", ret);
-		return ret;
-	}
-
-	/* Initialize our domain (associated with our fabric). A domain defines the boundary for associating
-	 * different resources together.
-	 */
-	ret = fi_domain(fabric, fi_pep, &domain, NULL);
-	if (ret) {
-		printf("fi_domain error (%d)\n", ret);
-		return ret;
-	}
-
-	/* Initialize our endpoint. Endpoints are transport level communication portals which are used to
-	 * initiate and drive communication. There are three main types of endpoints:
-	 * FI_EP_MSG - connected, reliable
-	 * FI_EP_RDM - unconnected, reliable
-	 * FI_EP_DGRAM - unconnected, unreliable
-	 * The type of endpoint will be requested in hints/fi_getinfo. Different providers support different
-	 * types of endpoints. TCP supports only FI_EP_MSG but when used with RxM, can support FI_EP_RDM.
-	 * In this application, we requested TCP and FI_EP_MSG.
-	 */
-
-    ret = fi_eq_open(fabric, &eq_attr, &eq, NULL);
-    if (ret) {
-            printf("fi_eq_open: %d\n", ret);
-            return ret;
-    }
-
-    ret = fi_passive_ep(fabric, fi_pep, &pep, NULL);
-    if (ret) {
-        printf("fi_passive_ep: %d\n", ret);
-        return ret;
-    }
-
-    ret = fi_pep_bind(pep, &eq->fid, 0);
-    if (ret) {
-        printf("fi_pep_bind %d", ret);
-        return ret;
-    }
-
-    ret = fi_listen(pep);
-    if (ret) {
-        printf("fi_listen %d", ret);
-        return ret;
-    }
-
-    if (!dst_addr) {
-        /* The server converts the returned fi_info->src_addr to a string for the client to
-         * use in its command line call. This address will get passed into the client's
-         * fi_getinfo call to resolve the server's address. */
-        sin = fi_pep->src_addr;
-        if (!inet_ntop(sin->sin_family, &sin->sin_addr, str_addr, sizeof(str_addr))) {
-            printf("error converting address to string\n");
-            return -1;
-        }
-
-        printf("Server started with addr %s\n", str_addr);
-    }
-
-    if (dst_addr) {
 	ret = fi_getinfo(FI_VERSION(1,9), dst_addr, port, dst_addr ? 0 : FI_SOURCE,
 			hints, &info);
 	if (ret) {
@@ -198,13 +93,6 @@ static int initialize(void)
         	printf("fi_domain: %d\n", ret);
         	return ret;
         }
-
-	ret = fi_domain_bind(domain, &eq->fid, 0);
-        if (ret) {
-            printf("fi_domain_bind: %d\n", ret);
-            return ret;
-        }
-
 
 	/* Initialize our completion queue. Completion queues are used to report events associated
 	 * with data transfers. In this example, we use one CQ that tracks sends and receives, but
@@ -253,16 +141,92 @@ static int initialize(void)
  	        return ret;
 	}
 
-        rd = fi_eq_sread(eq, &event, &entry, sizeof(entry), -1, 0);
-        if (rd != sizeof(entry)) {
-            ret = (int) rd;
-            printf("fi_eq_sread: %d\n", ret);
+    rd = fi_eq_sread(eq, &event, &entry, sizeof(entry), -1, 0);
+    if (rd != sizeof(entry)) {
+        ret = (int) rd;
+        printf("fi_eq_sread: %d\n", ret);
+        return ret;
+	}
+
+	return 0;
+}
+
+static int start_server(void)
+{
+	const struct sockaddr_in *sin;
+
+	/* The first OFI call to happen for initialization is fi_getinfo which queries libfabric
+	 * and returns any appropriate providers that fulfill the hints requirements. Any applicable
+	 * providers will be returned as a list of fi_info structs (&info). Any info can be selected.
+	 * In this test we select the first fi_info struct. Assuming all hints were set appropriately,
+	 * the first fi_info should be most appropriate.
+	 * The flag FI_SOURCE is set for the server to indicate that the address/port refer to source
+	 * information. This is not set for the client because the fields refer to the server, not
+	 * the caller (client). */
+	ret = fi_getinfo(FI_VERSION(1,9), dst_addr, port, dst_addr ? 0 : FI_SOURCE,
+			 		hints, &fi_pep);
+	if (ret) {
+		printf("fi_getinfo error (%d)\n", ret);
+		return ret;
+	}
+
+	/* Initialize our fabric. The fabric network represents a collection of hardware and software
+	 * resources that access a single physical or virtual network. All network ports on a system
+	 * that can communicate with each other through their attached networks belong to the same fabric.
+	 */
+	ret = fi_fabric(fi_pep->fabric_attr, &fabric, NULL);
+	if (ret) {
+		printf("fi_fabric error (%d)\n", ret);
+		return ret;
+	}
+
+	/* Initialize our endpoint. Endpoints are transport level communication portals which are used to
+	 * initiate and drive communication. There are three main types of endpoints:
+	 * FI_EP_MSG - connected, reliable
+	 * FI_EP_RDM - unconnected, reliable
+	 * FI_EP_DGRAM - unconnected, unreliable
+	 * The type of endpoint will be requested in hints/fi_getinfo. Different providers support different
+	 * types of endpoints. TCP supports only FI_EP_MSG but when used with RxM, can support FI_EP_RDM.
+	 * In this application, we requested TCP and FI_EP_MSG.
+	 */
+
+    ret = fi_eq_open(fabric, &eq_attr, &eq, NULL);
+    if (ret) {
+            printf("fi_eq_open: %d\n", ret);
             return ret;
-		}
-    } else {
-	ret = retrieve_conn_req(eq, &info);
-	if (ret)
-	    goto err;
+    }
+
+    ret = fi_passive_ep(fabric, fi_pep, &pep, NULL);
+    if (ret) {
+        printf("fi_passive_ep: %d\n", ret);
+        return ret;
+    }
+
+    ret = fi_pep_bind(pep, &eq->fid, 0);
+    if (ret) {
+        printf("fi_pep_bind %d", ret);
+        return ret;
+    }
+
+    ret = fi_listen(pep);
+    if (ret) {
+        printf("fi_listen %d", ret);
+        return ret;
+    }
+
+	return 0;
+}
+
+static int complete_connection(void)
+{
+
+	rd = fi_eq_sread(eq, &event, &entry, sizeof(entry), -1, 0);
+    if (rd != sizeof entry) {
+	ret = (int) rd;
+            printf("fi_eq_sread: %d", ret);
+		if (ret)
+			goto err;
+    }
 
 	ret = fi_domain(fabric, info, &domain, NULL);
 	if (ret) {
@@ -281,18 +245,19 @@ static int initialize(void)
          * with data transfers. In this example, we use one CQ that tracks sends and receives, but
          * often times there will be separate CQs for sends and receives.
 	 */
-        cq_attr.size = 128;
-    	cq_attr.format = FI_CQ_FORMAT_MSG;
-        ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
-        if (ret) {
-            printf("fi_cq_open error (%d)\n", ret);
-            return ret;
-        }
+    cq_attr.size = 128;
+    cq_attr.format = FI_CQ_FORMAT_MSG;
+    ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
+    if (ret) {
+        printf("fi_cq_open error (%d)\n", ret);
+        return ret;
+    }
 
-        /* Bind our CQ to our endpoint to track any sends and receives that come in or out on that endpoint.
-         * A CQ can be bound to multiple endpoints but one EP can only have one send CQ and one receive CQ
-         * (which can be the same CQ).
-	 */
+    /* Bind our CQ to our endpoint to track any sends and receives that 
+	 * come in or out on that endpoint. A CQ can be bound to multiple
+	 * endpoints but one EP can only have one send CQ and one receive CQ
+     * (which can be the same CQ).
+	*/
 
 	ret = fi_endpoint(domain, info, &ep, NULL);
         if (ret) {
@@ -313,8 +278,10 @@ static int initialize(void)
         }
 
 	ret = fi_enable(ep);
-        if (ret)
-                return ret;
+        if (ret) {
+			printf("fi_enable: %d", ret);
+            return ret;
+		}
 
 	ret = fi_accept(ep, NULL, 0);
 	if (ret) {
@@ -328,50 +295,52 @@ static int initialize(void)
 		printf("fi_eq_read: %d\n", ret);
 		return ret;
 	}
-    }
-
     return 0;
 
 err:
     if (info)
     	fi_reject(pep, info->handle, NULL, 0);
     return ret;
+
 }
 
 static void cleanup(void)
 {
 	int ret;
-
+	
 	/* All OFI resources are cleaned up using the same fi_close(fid) call. */
-	ret = fi_close(&ep->fid);
-	if (ret)
-		printf("warning: error closing EP (%d)\n", ret);
-
-	ret = fi_close(&pep->fid);
-	if (ret)
-		printf("warning: error closing PEP (%d)\n", ret);
+	if (ep) {
+		ret = fi_close(&ep->fid);
+		if (ret)
+			printf("warning: error closing EP (%d)\n", ret);
+	}
+	if (pep) {
+		ret = fi_close(&pep->fid);
+		if (ret)
+			printf("warning: error closing PEP (%d)\n", ret);
+	}
 
 	ret = fi_close(&cq->fid);
 	if (ret)
 		printf("warning: error closing CQ (%d)\n", ret);
-
+	
 	ret = fi_close(&domain->fid);
 	if (ret)
 		printf("warning: error closing domain (%d)\n", ret);
 
 	ret = fi_close(&eq->fid);
         if (ret)
-                printf("warning: error closing EQ (%d)\n", ret);
+            printf("warning: error closing EQ (%d)\n", ret);
 
 	ret = fi_close(&fabric->fid);
         if (ret)
-                printf("warning: error closing fabric (%d)\n", ret);
+            printf("warning: error closing fabric (%d)\n", ret);
 
 	if (info)
 		fi_freeinfo(info);
 
 	if (fi_pep)
-        	fi_freeinfo(fi_pep);
+        fi_freeinfo(fi_pep);
 }
 
 /* Post a receive buffer. This call does not ensure a message has been received, just
@@ -458,7 +427,7 @@ static int wait_cq(void)
 	if (comp.flags & FI_RECV)
 		printf("I received a message!\n");
 	else if (comp.flags & FI_SEND)
-		printf("My sent message got sent!\n");
+		printf("My message got sent!\n");
 
 	return 0;
 }
@@ -504,7 +473,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 
 	/* Server run with no args, client has server's address as an argument */
-	dst_addr = argv[optind];
+	dst_addr = argv[1];
 
 
 //Set anything in hints that the application needs
@@ -530,9 +499,19 @@ int main(int argc, char **argv)
 
 //Done setting hints
 
-	ret = initialize();
-	if (ret)
+	if (!dst_addr) {
+		ret = start_server();
+		if (ret) {
+			goto out;
+			return ret;
+		}
+	}
+
+	ret = dst_addr ? start_client() : complete_connection();
+	if (ret) {
 		goto out;
+		return ret;
+	}
 
 	ret = run();
 out:
